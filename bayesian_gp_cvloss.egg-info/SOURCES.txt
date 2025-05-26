@@ -1,0 +1,10 @@
+LICENSE
+README.md
+setup.py
+bayesian_gp_cvloss/__init__.py
+bayesian_gp_cvloss/optimizer.py
+bayesian_gp_cvloss.egg-info/PKG-INFO
+bayesian_gp_cvloss.egg-info/SOURCES.txt
+bayesian_gp_cvloss.egg-info/dependency_links.txt
+bayesian_gp_cvloss.egg-info/requires.txt
+bayesian_gp_cvloss.egg-info/top_level.txt
