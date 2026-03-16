@@ -27,7 +27,8 @@ This method directly targets the minimization of prediction error, which can be 
 *   Cross-validation (k-fold) integrated into the optimization loop to find parameters that generalize well.
 *   Directly optimizes for mean cross-validated RMSE.
 *   Supports various GPflow kernels (e.g., RBF, Matern32, Matern52, RationalQuadratic by default, easily extensible).
-*   Data-dependent default hyperparameter search space generation based on the target variable's statistics.
+*   **Smart data-dependent defaults**: search ranges for lengthscales, kernel variance, and noise variance are automatically computed from the training data.
+*   **Flexible overrides**: fine-tune individual search ranges (`kernels`, `lengthscale_bounds`, `kernel_variance_bounds`, `noise_variance_bounds`) without building a full Hyperopt space.
 *   Handles mean centering of the target variable internally for potentially improved stability.
 *   Simple API: provide your preprocessed numerical `X_train` and `y_train` data.
 
@@ -91,14 +92,24 @@ X_test_scaled = scaler.transform(X_test_data)
 y_train_np = y_train_data.values
 
 # 1. Initialize the Optimizer
-# Pass preprocessed X_train and y_train directly to the constructor.
-# A data-dependent default hyperparameter search space is generated automatically.
+# All search ranges are auto-computed from the data by default.
 optimizer = GPCrossValidatedOptimizer(
     X_train=X_train_scaled,
     y_train=y_train_np,
     n_splits=5,          # Number of CV folds
     random_state=42       # For reproducibility
 )
+
+# Or override specific settings:
+# optimizer = GPCrossValidatedOptimizer(
+#     X_train=X_train_scaled,
+#     y_train=y_train_np,
+#     kernels=["RBF", "Matern52"],          # Only search these kernels
+#     lengthscale_bounds=(0.05, 50.0),       # Custom range for all features
+#     noise_variance_bounds=(1e-6, 1.0),     # Custom noise variance range
+#     n_splits=5,
+#     random_state=42
+# )
 
 # 2. Run Optimization
 # This finds the best hyperparameters based on cross-validated RMSE
@@ -126,7 +137,7 @@ print(f"Test RMSE: {rmse_test:.4f}")
 
 ## How it Works Internally
 
-1.  **`__init__(X_train, y_train, hyperopt_space=None, n_splits=5, random_state=None)`**: Stores the preprocessed training data, computes `y_train_mean_` for internal centering, and generates a data-dependent default hyperparameter search space if `hyperopt_space` is not provided.
+1.  **`__init__(X_train, y_train, hyperopt_space=None, kernels=None, lengthscale_bounds=None, kernel_variance_bounds=None, noise_variance_bounds=None, n_splits=5, random_state=None)`**: Stores the preprocessed training data, computes `y_train_mean_` for internal centering, validates any user-provided bound overrides, and generates a data-dependent default hyperparameter search space. If `hyperopt_space` is provided, it takes full precedence and all individual bound kwargs are ignored.
 2.  **`optimize(max_evals=100, tpe_algo=tpe.suggest, early_stop_fn=None, rstate_seed=None)`**:
     *   Initializes `hyperopt.Trials()`.
     *   Runs `hyperopt.fmin()` with the `_objective` function, the defined search space, `tpe.suggest` algorithm, and `max_evals`.
@@ -144,11 +155,11 @@ print(f"Test RMSE: {rmse_test:.4f}")
     *   Averages the RMSEs from all validation folds.
     *   Returns a dictionary including `{'loss': avg_val_rmse, 'status': STATUS_OK, ...}`.
 4.  **`_get_default_data_dependent_space()`**:
-    *   Defines the search space for Hyperopt for each hyperparameter:
-        *   `lengthscales_{i}`: `hp.quniform` between 0.1 and 100 (step 0.01) for each input dimension.
-        *   `kernel_variance`: `hp.uniform` between 1e-6 and `y_train.var()`.
-        *   `likelihood_noise_variance`: `hp.loguniform` between `(y_train.std()/100)**2` and `(y_train.std()/2)**2` (with safety checks for small/zero std dev).
-        *   `kernel_name`: `hp.choice` among the default kernels (Matern32, Matern52, RBF, RationalQuadratic).
+    *   Defines the search space for Hyperopt for each hyperparameter, respecting any user-provided bound overrides:
+        *   `lengthscales_{i}`: `hp.quniform` with per-feature data-driven bounds (based on each feature's std), or user-provided `lengthscale_bounds`.
+        *   `kernel_variance`: `hp.uniform` between 1e-6 and `2 * Var(y)`, or user-provided `kernel_variance_bounds`.
+        *   `likelihood_noise_variance`: `hp.loguniform` between `(y_train.std()/100)**2` and `y_train.std()**2`, or user-provided `noise_variance_bounds`.
+        *   `kernel_name`: `hp.choice` among the active kernels (all defaults, or a user-specified subset via `kernels`).
 5.  **`refit_best_model()`**:
     *   Trains a new GPflow GPR model using `self.best_params` on the *entire* training data (centered using `self.y_train_mean_`).
     *   Stores this model as `self.best_model_`.
@@ -160,8 +171,13 @@ print(f"Test RMSE: {rmse_test:.4f}")
 
 ## Customization
 
-*   **Kernels**: Modify `DEFAULT_KERNELS` in `bayesian_gp_cvloss.optimizer` or provide a custom `hyperopt_space` with your desired `kernel_name` choices.
-*   **Hyperparameter Space**: Pass a custom `hyperopt_space` dictionary to the `GPCrossValidatedOptimizer` constructor. The space must include keys for `lengthscales_{i}` (for each feature), `kernel_variance`, `likelihood_noise_variance`, and `kernel_name`.
+The optimizer follows a **smart defaults + optional overrides** design. You can override as much or as little as you need:
+
+*   **Kernels**: Pass `kernels=["RBF", "Matern52"]` to search only specific kernels. Valid names: `Matern32`, `Matern52`, `RBF`, `RationalQuadratic`.
+*   **Lengthscale range**: Pass `lengthscale_bounds=(0.05, 50.0)` to set a uniform range for all features. By default, per-feature bounds are computed from the data.
+*   **Kernel variance range**: Pass `kernel_variance_bounds=(1e-4, 10.0)`. Defaults to `(1e-6, 2 * Var(y))`.
+*   **Noise variance range**: Pass `noise_variance_bounds=(1e-6, 1.0)`. Defaults to a data-dependent log-uniform range.
+*   **Full custom space**: Pass `hyperopt_space={...}` for complete control. This overrides all individual bound kwargs. The space must include keys for `lengthscales_{i}` (for each feature), `kernel_variance`, `likelihood_noise_variance`, and `kernel_name`.
 *   **Cross-Validation**: Change `n_splits` and `random_state` in the constructor.
 *   **Hyperopt**: Adjust `max_evals` and `rstate_seed` in the `optimize()` method.
 
