@@ -2,7 +2,7 @@ from setuptools import setup, find_packages
 
 setup(
     name='bayesian-gp-cvloss',
-    version='0.1.2',
+    version='0.1.6',
     author='Shifa Zhong',
     author_email='sfzhong@tongji.edu.cn',
     description='A Python package for Gaussian Process Regression with hyperparameter optimization using Hyperopt and cross-validation, focusing on optimizing cross-validated loss.',
@@ -21,7 +21,7 @@ setup(
         'Development Status :: 3 - Alpha',
         'Intended Audience :: Science/Research',
         'Intended Audience :: Developers',
-        'License :: OSI Approved :: MIT License',
+
         'Programming Language :: Python :: 3',
         'Programming Language :: Python :: 3.8',
         'Programming Language :: Python :: 3.9',
