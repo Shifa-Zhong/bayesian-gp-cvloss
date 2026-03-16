@@ -7,11 +7,8 @@ from sklearn.metrics import mean_squared_error
 # StandardScaler and JamesSteinEncoder are no longer direct dependencies for the class
 # but might be used by the user or the optional preprocessing utility.
 from hyperopt import fmin, tpe, hp, Trials, STATUS_OK
-import tensorflow as tf
 import logging
 
-# Configure basic logging
-logging.basicConfig(level=logging.INFO, format='%(asctime)s - %(levelname)s - %(message)s')
 logger = logging.getLogger(__name__)
 
 # Default GP Kernels from GPflow - user can specify these in the space
@@ -81,7 +78,7 @@ class GPCrossValidatedOptimizer:
         y_std = np.std(self.y_train_1d)
 
         kernel_var_upper = float(y_var)
-        kernel_var_lower = 0 
+        kernel_var_lower = 1e-6
         logger.info(f"Default kernel_variance range: ({kernel_var_lower:.2e}, {kernel_var_upper:.2e})")
         space['kernel_variance'] = hp.uniform('kernel_variance', kernel_var_lower, kernel_var_upper)
 

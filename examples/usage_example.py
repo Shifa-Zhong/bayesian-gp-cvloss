@@ -5,9 +5,9 @@ from sklearn.compose import ColumnTransformer
 from sklearn.pipeline import Pipeline
 from hyperopt import hp # For defining a custom space, if desired
 
-from gpr_hyperopt_cv import GPCrossValidatedOptimizer
+from bayesian_gp_cvloss import GPCrossValidatedOptimizer
 # DEFAULT_KERNELS can still be imported if user wants to build a custom space with specific kernels
-from gpr_hyperopt_cv.optimizer import DEFAULT_KERNELS
+from bayesian_gp_cvloss.optimizer import DEFAULT_KERNELS
 
 def create_sample_dataframe(num_samples=100, random_seed=42):
     np.random.seed(random_seed)

@@ -1,6 +1,6 @@
 # Bayesian GP CVLoss: Gaussian Process Regression with Cross-Validated Hyperparameter Optimization
 
-[![PyPI version](https://badge.fury.io/py/bayesian-gp-cvloss.svg)](https://badge.fury.io/py/bayesian-gp-cvloss) <!-- Placeholder for PyPI badge -->
+[![PyPI version](https://badge.fury.io/py/bayesian-gp-cvloss.svg)](https://badge.fury.io/py/bayesian-gp-cvloss)
 
 `bayesian_gp_cvloss` is a Python package designed to simplify the process of training Gaussian Process (GP) models by finding optimal hyperparameters through Bayesian optimization (using Hyperopt) with k-fold cross-validation. The key feature of this package is its direct optimization of the cross-validated Root Mean Squared Error (RMSE), aligning the hyperparameter tuning process closely with the model's predictive performance.
 
@@ -40,9 +40,8 @@ pip install bayesian-gp-cvloss
 Alternatively, to install the latest version directly from the source (e.g., for development):
 
 ```bash
-# Ensure you have git installed
-# git clone https://github.com/Shifa-Zhong/bayesian-gp-cvloss.git
-# cd bayesian-gp-cvloss
+git clone https://github.com/Shifa-Zhong/bayesian-gp-cvloss.git
+cd bayesian-gp-cvloss
 pip install .
 ```
 
@@ -64,130 +63,107 @@ import pandas as pd
 from sklearn.preprocessing import StandardScaler
 from sklearn.model_selection import train_test_split
 
-from bayesian_gp_cvloss.optimizer import GPCrossValidatedOptimizer
+from bayesian_gp_cvloss import GPCrossValidatedOptimizer
 
 # 0. (User Responsibility) Load and Preprocess Data
-# Example: Assume you have X (features) and y (target) as pandas DataFrames/Series
 # Ensure X is purely numerical. All encoding and scaling is up to the user.
 
-# Let's create some synthetic data for demonstration
+# Create some synthetic data for demonstration
 np.random.seed(42)
 N_train = 100
 N_features = 3
 X_synth = np.random.rand(N_train, N_features)
-# A simple function for y with some noise
 y_synth = np.sin(X_synth[:, 0] * 2 * np.pi) + X_synth[:, 1]**2 + np.random.randn(N_train) * 0.1
 
-# Convert to pandas DataFrame/Series if your data isn't already
 X_df = pd.DataFrame(X_synth, columns=[f'feature_{i}' for i in range(N_features)])
 y_series = pd.Series(y_synth, name='target')
 
-# Split data (optional, but good practice to have a final test set)
-# The optimizer does its own CV on the X_train_opt, y_train_opt
+# Split data
 X_train_data, X_test_data, y_train_data, y_test_data = train_test_split(
     X_df, y_series, test_size=0.2, random_state=42
 )
 
-# Scale features (example - user should choose appropriate scaling)
+# Scale features
 scaler = StandardScaler()
 X_train_scaled = scaler.fit_transform(X_train_data)
 X_test_scaled = scaler.transform(X_test_data)
 
-# Optimizer expects numpy arrays
-X_train_np = X_train_scaled
 y_train_np = y_train_data.values
 
-X_test_np = X_test_scaled
-y_test_np = y_test_data.values
-
 # 1. Initialize the Optimizer
-# You can specify kernels, number of folds, max_evals for Hyperopt, etc.
+# Pass preprocessed X_train and y_train directly to the constructor.
+# A data-dependent default hyperparameter search space is generated automatically.
 optimizer = GPCrossValidatedOptimizer(
-    n_folds=5, 
-    max_evals=50, # Number of Hyperopt trials (increase for better results)
-    random_state_hyperopt=42
+    X_train=X_train_scaled,
+    y_train=y_train_np,
+    n_splits=5,          # Number of CV folds
+    random_state=42       # For reproducibility
 )
 
 # 2. Run Optimization
-# This will find the best hyperparameters based on cross-validated RMSE
-# using X_train_np and y_train_np
-optimizer.optimize(X_train_np, y_train_np)
+# This finds the best hyperparameters based on cross-validated RMSE
+# and automatically refits a final model on the full training data.
+best_params = optimizer.optimize(max_evals=50)
 
-print(f"Best hyperparameters found: {optimizer.best_params}")
-print(f"Best CV validation RMSE: {optimizer.best_cv_val_rmse_}")
-print(f"Best CV train RMSE: {optimizer.best_cv_train_rmse_}")
+print(f"Best hyperparameters found: {best_params}")
 
-# 3. Get the Refitted Model (Optional)
-# The optimizer automatically refits a model on the full X_train_np, y_train_np 
-# using the best hyperparameters. You can access it if needed.
-# best_gpr_model = optimizer.get_refitted_model()
-# print_summary(best_gpr_model) # Requires gpflow
+# Access the best trial's CV RMSE from the trials object
+trials = optimizer.get_optimization_results()
+if trials.best_trial:
+    print(f"Best CV RMSE: {trials.best_trial['result']['loss']:.4f}")
+    print(f"Best CV Train RMSE: {trials.best_trial['result']['train_loss']:.4f}")
 
-# 4. Make Predictions
-# The predict method uses the refitted model.
-# Input to predict should be preprocessed in the same way as X_train_np
-y_pred_test, y_pred_var_test = optimizer.predict(X_test_np)
+# 3. Make Predictions
+# The predict method uses the refitted model and returns predictions
+# on the original (uncentered) scale.
+y_pred_test, y_pred_var_test = optimizer.predict(X_test_scaled)
 
-# Evaluate (example)
+# 4. Evaluate
 from sklearn.metrics import mean_squared_error
-rmse_test = np.sqrt(mean_squared_error(y_test_np, y_pred_test))
-print(f"Test RMSE: {rmse_test}")
-
-# Plot results (example)
-import matplotlib.pyplot as plt
-plt.figure(figsize=(8, 6))
-plt.scatter(y_test_np, y_pred_test, alpha=0.7, label='Test Predictions')
-plt.plot([min(y_test_np), max(y_test_np)], [min(y_test_np), max(y_test_np)], 'r--', label='Ideal')
-plt.xlabel("True Values")
-plt.ylabel("Predicted Values")
-plt.title("GPR Predictions vs True Values on Test Set")
-plt.legend()
-plt.grid(True)
-plt.show()
-
+rmse_test = np.sqrt(mean_squared_error(y_test_data.values, y_pred_test))
+print(f"Test RMSE: {rmse_test:.4f}")
 ```
 
 ## How it Works Internally
 
-1.  **`__init__(...)`**: Initializes settings like number of folds (`n_folds`), Hyperopt maximum evaluations (`max_evals`), desired kernels (`kernels_to_try`), and random states.
-2.  **`optimize(X_train, y_train)`**:
-    *   Stores `X_train` and `y_train`.
-    *   Calculates `self.y_train_mean_` for internal centering.
-    *   Calls `_get_default_data_dependent_space(y_train)` to define the hyperparameter search space for Hyperopt. This space is dynamically adjusted based on the variance and standard deviation of `y_train` to provide sensible default ranges for kernel variance and likelihood noise.
+1.  **`__init__(X_train, y_train, hyperopt_space=None, n_splits=5, random_state=None)`**: Stores the preprocessed training data, computes `y_train_mean_` for internal centering, and generates a data-dependent default hyperparameter search space if `hyperopt_space` is not provided.
+2.  **`optimize(max_evals=100, tpe_algo=tpe.suggest, early_stop_fn=None, rstate_seed=None)`**:
     *   Initializes `hyperopt.Trials()`.
-    *   Runs `hyperopt.fmin()` with the `_objective` function, the defined `space`, `tpe.suggest` algorithm, and `max_evals`.
-    *   Stores the best parameters (`self.best_params`), best cross-validated validation RMSE (`self.best_cv_val_rmse_`), and corresponding training RMSE (`self.best_cv_train_rmse_`).
-    *   Calls `refit_best_model(X_train, y_train)` to train a final GPR model on the full training data using `self.best_params`.
+    *   Runs `hyperopt.fmin()` with the `_objective` function, the defined search space, `tpe.suggest` algorithm, and `max_evals`.
+    *   Stores the best parameters in `self.best_params`.
+    *   Calls `refit_best_model()` to train a final GPR model on the full training data using `self.best_params`.
+    *   Returns `self.best_params`.
 3.  **`_objective(params)`**:
     *   This is the function minimized by Hyperopt.
     *   It takes a dictionary of `params` (hyperparameters for a single trial).
     *   Performs k-fold cross-validation:
-        *   For each fold, splits `X_train`, `y_train` into `X_train_fold`, `y_train_fold` and `X_val_fold`, `y_val_fold`.
-        *   **Important**: `y_train_fold` and `y_val_fold` are centered by subtracting the mean of the *current* `y_train_fold`.
+        *   For each fold, splits `X_train`, `y_train` into training and validation subsets.
+        *   **Important**: The target variable in each fold is centered by subtracting the mean of the *current fold's* training target.
         *   Constructs a GPflow GPR model using the hyperparameters from `params` and the current fold's training data.
-        *   Predicts on `X_val_fold` and calculates RMSE.
+        *   Predicts on the validation fold and calculates RMSE.
     *   Averages the RMSEs from all validation folds.
     *   Returns a dictionary including `{'loss': avg_val_rmse, 'status': STATUS_OK, ...}`.
-4.  **`_get_default_data_dependent_space(y_train)`**: 
+4.  **`_get_default_data_dependent_space()`**:
     *   Defines the search space for Hyperopt for each hyperparameter:
-        *   `lengthscales`: `hp.quniform` between 1 and 100 (step 0.01) for each input dimension.
-        *   `kernel_variance`: `hp.uniform` between 0 and `y_train.var()`.
+        *   `lengthscales_{i}`: `hp.quniform` between 0.1 and 100 (step 0.01) for each input dimension.
+        *   `kernel_variance`: `hp.uniform` between 1e-6 and `y_train.var()`.
         *   `likelihood_noise_variance`: `hp.loguniform` between `(y_train.std()/100)**2` and `(y_train.std()/2)**2` (with safety checks for small/zero std dev).
-        *   `kernel_class`: `hp.choice` among the kernels specified in `self.kernels_to_try`.
-5.  **`refit_best_model(X_data_refit, y_data_refit)`**:
-    *   Trains a new GPflow GPR model using `self.best_params` on the *entire* `X_data_refit` and `y_data_refit` (which are centered using `self.y_train_mean_`).
-    *   Stores this model as `self.final_model_`.
-6.  **`predict(X_new)`**:
-    *   Takes new, preprocessed data `X_new`.
-    *   Uses `self.final_model_` to predict mean and variance.
+        *   `kernel_name`: `hp.choice` among the default kernels (Matern32, Matern52, RBF, RationalQuadratic).
+5.  **`refit_best_model()`**:
+    *   Trains a new GPflow GPR model using `self.best_params` on the *entire* training data (centered using `self.y_train_mean_`).
+    *   Stores this model as `self.best_model_`.
+6.  **`predict(X_new_processed)`**:
+    *   Takes new, preprocessed data `X_new_processed`.
+    *   Uses `self.best_model_` to predict mean and variance.
     *   Adds back `self.y_train_mean_` to the predicted mean to return predictions on the original scale.
+    *   Returns `(pred_mean, pred_var)` as NumPy arrays.
 
 ## Customization
 
-*   **Kernels**: Pass a list of GPflow kernel classes to the `kernels_to_try` argument in the `GPCrossValidatedOptimizer` constructor (e.g., `[gpflow.kernels.Matern52, gpflow.kernels.RBF]`).
-*   **Hyperparameter Space**: While a data-dependent default space is provided, you can supply your own `hyperopt_space` dictionary to the `optimize` method if you need finer control or different distributions for hyperparameters.
-*   **Cross-Validation**: Change `n_folds` and `random_state_kfold`.
-*   **Hyperopt**: Adjust `max_evals` and `random_state_hyperopt`.
+*   **Kernels**: Modify `DEFAULT_KERNELS` in `bayesian_gp_cvloss.optimizer` or provide a custom `hyperopt_space` with your desired `kernel_name` choices.
+*   **Hyperparameter Space**: Pass a custom `hyperopt_space` dictionary to the `GPCrossValidatedOptimizer` constructor. The space must include keys for `lengthscales_{i}` (for each feature), `kernel_variance`, `likelihood_noise_variance`, and `kernel_name`.
+*   **Cross-Validation**: Change `n_splits` and `random_state` in the constructor.
+*   **Hyperopt**: Adjust `max_evals` and `rstate_seed` in the `optimize()` method.
 
 ## Contributing
 
@@ -200,4 +176,4 @@ This project is licensed under the MIT License - see the [LICENSE](LICENSE) file
 ## Author
 
 Shifa Zhong (sfzhong@tongji.edu.cn)
-GitHub: [Shifa-Zhong](https://github.com/Shifa-Zhong) 
+GitHub: [Shifa-Zhong](https://github.com/Shifa-Zhong)

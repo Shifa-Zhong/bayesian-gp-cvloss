@@ -6,7 +6,7 @@ setup(
     author='Shifa Zhong',
     author_email='sfzhong@tongji.edu.cn',
     description='A Python package for Gaussian Process Regression with hyperparameter optimization using Hyperopt and cross-validation, focusing on optimizing cross-validated loss.',
-    long_description=open('README.md').read(),
+    long_description=open('README.md', encoding='utf-8').read(),
     long_description_content_type='text/markdown',
     url='https://github.com/Shifa-Zhong/bayesian-gp-cvloss',
     packages=find_packages(),
