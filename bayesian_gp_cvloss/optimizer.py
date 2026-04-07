@@ -2,7 +2,7 @@ import pandas as pd
 import numpy as np
 import gpflow
 from gpflow.utilities import set_trainable
-from sklearn.model_selection import KFold
+from sklearn.model_selection import KFold, LeaveOneOut
 from sklearn.metrics import mean_squared_error
 from hyperopt import fmin, tpe, hp, Trials, STATUS_OK
 import logging
@@ -19,44 +19,71 @@ DEFAULT_KERNELS = {
     #"Exponential": gpflow.kernels.Exponential
 }
 
+VALID_SCORING = ("cv_rmse", "nlpd", "combined")
+
+
 class GPCrossValidatedOptimizer:
     """
     Optimizes hyperparameters for a Gaussian Process Regressor using Hyperopt
-    with k-fold cross-validation, minimizing RMSE.
-    Assumes input data X_train and y_train are already preprocessed (numerical and scaled).
-    Generates a data-dependent default hyperparameter space if none is provided.
+    with k-fold cross-validation.
 
-    Users can fine-tune individual search ranges via constructor kwargs (kernels,
-    lengthscale_bounds, kernel_variance_bounds, noise_variance_bounds) without
-    having to build a full hyperopt space dict.  If ``hyperopt_space`` is given,
-    it takes full precedence and all individual bound kwargs are ignored.
+    Supports three scoring objectives:
+
+    * ``"cv_rmse"`` (default) – minimise mean cross-validated RMSE.
+      Directly targets prediction accuracy; backward-compatible with v0.1.x.
+    * ``"nlpd"``  – minimise mean cross-validated Negative Log Predictive
+      Density.  Simultaneously rewards accurate means **and** well-calibrated
+      uncertainty estimates, which is important when the GP model drives an
+      acquisition function (e.g. in Bayesian optimisation).
+    * ``"combined"`` – minimise a weighted sum
+      ``nlpd_weight * NLPD + (1 - nlpd_weight) * RMSE`` (both
+      min-max-normalised within each trial so the weight is meaningful).
+
+    When the training set is very small (fewer samples than ``n_splits``), the
+    splitter automatically falls back to Leave-One-Out (LOO) cross-validation
+    to avoid folds with zero validation samples.
+
+    Users can fine-tune individual search ranges via constructor kwargs
+    (``kernels``, ``lengthscale_bounds``, ``kernel_variance_bounds``,
+    ``noise_variance_bounds``) without having to build a full hyperopt space
+    dict.  If ``hyperopt_space`` is given, it takes full precedence and all
+    individual bound kwargs are ignored.
     """
+
     def __init__(self, X_train, y_train,
                  hyperopt_space=None,
                  kernels=None,
                  lengthscale_bounds=None,
                  kernel_variance_bounds=None,
                  noise_variance_bounds=None,
+                 scoring="cv_rmse",
+                 nlpd_weight=0.5,
                  n_splits=5, random_state=None):
         """
         Args:
-            X_train (pd.DataFrame or np.ndarray): The preprocessed training feature dataset.
-            y_train (pd.Series or np.ndarray): The preprocessed training target variable.
-            hyperopt_space (dict, optional): Full Hyperopt search space. If provided,
-                all individual bound kwargs below are ignored.
-            kernels (list of str, optional): Kernel names to search over. Must be
-                keys in DEFAULT_KERNELS (e.g. ["RBF", "Matern52"]). Defaults to all
-                kernels in DEFAULT_KERNELS.
-            lengthscale_bounds (tuple or None): (low, high) for lengthscale search
-                range applied uniformly to all features. If None, data-dependent
-                per-feature bounds are computed automatically.
-            kernel_variance_bounds (tuple or None): (low, high) for kernel variance.
-                If None, defaults to (1e-6, 2 * Var(y)).
-            noise_variance_bounds (tuple or None): (low, high) for likelihood noise
-                variance (log-uniform). If None, data-dependent defaults are used.
-            n_splits (int): Number of folds for KFold cross-validation.
-            random_state (int, optional): Random seed for KFold and Hyperopt for reproducibility.
+            X_train (pd.DataFrame or np.ndarray): Preprocessed training features (2D).
+            y_train (pd.Series or np.ndarray): Training target (1D or 2D single-column).
+            hyperopt_space (dict, optional): Full Hyperopt search space.  If
+                provided, all individual bound kwargs below are ignored.
+            kernels (list of str, optional): Kernel names to search.  Must be
+                keys in DEFAULT_KERNELS.  Defaults to all.
+            lengthscale_bounds (tuple or None): (low, high) for lengthscale
+                search range (uniform across features).  If None, per-feature
+                data-dependent bounds are computed.
+            kernel_variance_bounds (tuple or None): (low, high) for kernel
+                variance.  If None, defaults to (1e-6, 2 * Var(y)).
+            noise_variance_bounds (tuple or None): (low, high) for likelihood
+                noise variance (log-uniform).  If None, data-dependent.
+            scoring (str): Optimisation objective.  One of ``"cv_rmse"``,
+                ``"nlpd"``, or ``"combined"``.
+            nlpd_weight (float): Weight for the NLPD term when
+                ``scoring="combined"``.  Must be in (0, 1).  Ignored for other
+                scoring modes.
+            n_splits (int): Number of folds for KFold CV.  If the training set
+                has fewer samples, Leave-One-Out is used automatically.
+            random_state (int, optional): Random seed for reproducibility.
         """
+        # --- Validate X_train / y_train ---
         if not isinstance(X_train, (pd.DataFrame, np.ndarray)):
             raise ValueError("X_train must be a pandas DataFrame or NumPy ndarray.")
         if not isinstance(y_train, (pd.Series, np.ndarray)):
@@ -80,6 +107,33 @@ class GPCrossValidatedOptimizer:
         self.n_splits = n_splits
         self.random_state = random_state
         self.num_features = X_train.shape[1]
+
+        # --- Validate scoring ---
+        if scoring not in VALID_SCORING:
+            raise ValueError(
+                f"scoring must be one of {VALID_SCORING}, got {scoring!r}"
+            )
+        self.scoring = scoring
+
+        if scoring == "combined":
+            if not (0 < nlpd_weight < 1):
+                raise ValueError(
+                    f"nlpd_weight must be in (0, 1), got {nlpd_weight}"
+                )
+        self.nlpd_weight = float(nlpd_weight)
+
+        # --- Determine CV splitter (auto-LOO for small samples) ---
+        n_samples = X_train.shape[0]
+        if n_samples < n_splits:
+            logger.info(
+                f"n_samples ({n_samples}) < n_splits ({n_splits}): "
+                f"automatically switching to Leave-One-Out cross-validation."
+            )
+            self._use_loo = True
+            self._effective_n_splits = n_samples
+        else:
+            self._use_loo = False
+            self._effective_n_splits = n_splits
 
         # --- Validate and store individual override kwargs ---
         # Active kernels
@@ -126,6 +180,10 @@ class GPCrossValidatedOptimizer:
         self.best_model_ = None
         self._iteration_count = 0
 
+    # ------------------------------------------------------------------
+    # Static helpers
+    # ------------------------------------------------------------------
+
     @staticmethod
     def _validate_bounds(bounds, name):
         """Validate a (low, high) bounds tuple. Returns the tuple or None."""
@@ -141,6 +199,28 @@ class GPCrossValidatedOptimizer:
         if low >= high:
             raise ValueError(f"{name} requires low < high, got ({low}, {high})")
         return (float(low), float(high))
+
+    @staticmethod
+    def _compute_nlpd(y_true, pred_mean, pred_var):
+        """Compute mean Negative Log Predictive Density.
+
+        NLPD(y, μ, σ²) = 0.5·log(2π) + 0.5·log(σ²) + 0.5·(y-μ)²/σ²
+
+        Lower is better.  A well-calibrated model achieves a lower NLPD than
+        one with the same RMSE but poorly-calibrated variance.
+        """
+        # Clamp variance to avoid log(0) and division by zero
+        safe_var = np.maximum(pred_var, 1e-12)
+        nlpd_per_point = (
+            0.5 * np.log(2 * np.pi)
+            + 0.5 * np.log(safe_var)
+            + 0.5 * (y_true - pred_mean) ** 2 / safe_var
+        )
+        return float(np.mean(nlpd_per_point))
+
+    # ------------------------------------------------------------------
+    # Search space construction
+    # ------------------------------------------------------------------
 
     def _compute_feature_lengthscale_bounds(self):
         """Compute data-driven per-feature lengthscale bounds based on feature std."""
@@ -211,13 +291,24 @@ class GPCrossValidatedOptimizer:
         space['kernel_name'] = hp.choice('kernel_name', list(self._active_kernels.keys()))
         return space
 
+    # ------------------------------------------------------------------
+    # Core CV objective
+    # ------------------------------------------------------------------
+
     def _objective(self, params):
         self._iteration_count += 1
         iteration_num = self._iteration_count
 
-        kf = KFold(n_splits=self.n_splits, shuffle=True, random_state=self.random_state)
+        # --- Build CV splitter ---
+        if self._use_loo:
+            splitter = LeaveOneOut()
+        else:
+            splitter = KFold(n_splits=self.n_splits, shuffle=True,
+                             random_state=self.random_state)
+
         fold_rmses = []
         fold_train_rmses = []
+        fold_nlpds = []
 
         kernel_name = params['kernel_name']
         selected_kernel_class = self._active_kernels.get(kernel_name) or DEFAULT_KERNELS.get(kernel_name)
@@ -243,7 +334,7 @@ class GPCrossValidatedOptimizer:
         X_data_for_cv = self.X_train.values if isinstance(self.X_train, pd.DataFrame) else self.X_train
         y_data_1d_for_cv = self.y_train_1d
 
-        for fold_idx, (train_index, val_index) in enumerate(kf.split(X_data_for_cv)):
+        for fold_idx, (train_index, val_index) in enumerate(splitter.split(X_data_for_cv)):
             X_train_fold, X_val_fold = X_data_for_cv[train_index], X_data_for_cv[val_index]
             y_train_fold_1d, y_val_fold_1d = y_data_1d_for_cv[train_index], y_data_1d_for_cv[val_index]
 
@@ -252,7 +343,7 @@ class GPCrossValidatedOptimizer:
             y_train_fold_centered = y_train_fold_1d - current_fold_y_train_mean
             y_val_fold_centered = y_val_fold_1d - current_fold_y_train_mean
 
-            y_train_fold_2d = y_train_fold_centered.reshape(-1,1)
+            y_train_fold_2d = y_train_fold_centered.reshape(-1, 1)
 
             try:
                 fold_kernel = selected_kernel_class(**kernel_hparams)
@@ -264,32 +355,98 @@ class GPCrossValidatedOptimizer:
                 set_trainable(model.kernel.lengthscales, False)
                 set_trainable(model.likelihood.variance, False)
 
-                y_pred_val_centered, _ = model.predict_y(X_val_fold)
+                y_pred_val_centered, y_pred_var_val = model.predict_y(X_val_fold)
                 y_pred_train_centered, _ = model.predict_y(X_train_fold)
 
-                fold_rmse = np.sqrt(mean_squared_error(y_val_fold_centered, y_pred_val_centered.numpy()))
-                fold_train_rmse = np.sqrt(mean_squared_error(y_train_fold_centered, y_pred_train_centered.numpy()))
+                y_pred_val_np = y_pred_val_centered.numpy().flatten()
+                y_pred_var_np = y_pred_var_val.numpy().flatten()
+                y_val_centered_flat = y_val_fold_centered.flatten()
+
+                fold_rmse = np.sqrt(mean_squared_error(y_val_centered_flat, y_pred_val_np))
+                fold_train_rmse = np.sqrt(mean_squared_error(
+                    y_train_fold_centered, y_pred_train_centered.numpy().flatten()
+                ))
+                fold_nlpd = self._compute_nlpd(y_val_centered_flat, y_pred_val_np, y_pred_var_np)
+
                 fold_rmses.append(fold_rmse)
                 fold_train_rmses.append(fold_train_rmse)
+                fold_nlpds.append(fold_nlpd)
             except Exception as e:
                 logger.warning(f"Fold {fold_idx+1} error for params {params}: {e}. High loss.")
                 fold_rmses.append(np.inf)
                 fold_train_rmses.append(np.inf)
+                fold_nlpds.append(np.inf)
                 break
 
-        avg_cv_rmse = np.mean(fold_rmses) if fold_rmses and np.all(np.isfinite(fold_rmses)) else np.inf
-        avg_train_rmse = np.mean(fold_train_rmses) if fold_train_rmses and np.all(np.isfinite(fold_train_rmses)) else np.inf
+        # --- Aggregate fold metrics ---
+        def _safe_mean(arr):
+            return np.mean(arr) if arr and np.all(np.isfinite(arr)) else np.inf
 
-        ls_rounded = np.round(lengthscales,2)
-        logger.info(f"Iter: {iteration_num:>3} | CV RMSE: {avg_cv_rmse:<8.4f} | Train RMSE: {avg_train_rmse:<8.4f} | Kernel: {kernel_name} | Var: {kernel_hparams['variance']:.4f} | Noise: {current_noise_variance:.6f} | LS: {ls_rounded}")
+        avg_cv_rmse = _safe_mean(fold_rmses)
+        avg_train_rmse = _safe_mean(fold_train_rmses)
+        avg_cv_nlpd = _safe_mean(fold_nlpds)
+
+        # --- Select loss according to scoring mode ---
+        if self.scoring == "cv_rmse":
+            loss = avg_cv_rmse
+        elif self.scoring == "nlpd":
+            loss = avg_cv_nlpd
+        else:  # combined
+            # Min-max normalise both metrics within the trial so the weight
+            # is meaningful regardless of value scales.
+            # For the very first trial we don't have history, so we use both
+            # raw values.  After a few trials the normalisation stabilises.
+            if len(self.trials.trials) > 0:
+                past_rmses = [
+                    t['result'].get('cv_rmse', np.inf)
+                    for t in self.trials.trials
+                    if 'result' in t and t['result']['status'] == STATUS_OK
+                ]
+                past_nlpds = [
+                    t['result'].get('cv_nlpd', np.inf)
+                    for t in self.trials.trials
+                    if 'result' in t and t['result']['status'] == STATUS_OK
+                ]
+                # Only normalise if we have finite history
+                finite_rmses = [v for v in past_rmses if np.isfinite(v)]
+                finite_nlpds = [v for v in past_nlpds if np.isfinite(v)]
+
+                if finite_rmses and finite_nlpds:
+                    rmse_min, rmse_max = min(finite_rmses), max(finite_rmses)
+                    nlpd_min, nlpd_max = min(finite_nlpds), max(finite_nlpds)
+                    rmse_range = rmse_max - rmse_min if rmse_max > rmse_min else 1.0
+                    nlpd_range = nlpd_max - nlpd_min if nlpd_max > nlpd_min else 1.0
+                    norm_rmse = (avg_cv_rmse - rmse_min) / rmse_range
+                    norm_nlpd = (avg_cv_nlpd - nlpd_min) / nlpd_range
+                    loss = (1 - self.nlpd_weight) * norm_rmse + self.nlpd_weight * norm_nlpd
+                else:
+                    loss = (1 - self.nlpd_weight) * avg_cv_rmse + self.nlpd_weight * avg_cv_nlpd
+            else:
+                loss = (1 - self.nlpd_weight) * avg_cv_rmse + self.nlpd_weight * avg_cv_nlpd
+
+        ls_rounded = np.round(lengthscales, 2)
+        cv_type = "LOO" if self._use_loo else f"{self._effective_n_splits}-Fold"
+        logger.info(
+            f"Iter: {iteration_num:>3} | {cv_type} RMSE: {avg_cv_rmse:<8.4f} | "
+            f"NLPD: {avg_cv_nlpd:<8.4f} | Train RMSE: {avg_train_rmse:<8.4f} | "
+            f"Loss({self.scoring}): {loss:<8.4f} | "
+            f"Kernel: {kernel_name} | Var: {kernel_hparams['variance']:.4f} | "
+            f"Noise: {current_noise_variance:.6f} | LS: {ls_rounded}"
+        )
 
         return {
-            'loss': avg_cv_rmse,
+            'loss': loss,
             'status': STATUS_OK,
             'params': params,
             'iteration': iteration_num,
-            'train_loss': avg_train_rmse
+            'train_loss': avg_train_rmse,
+            'cv_rmse': avg_cv_rmse,
+            'cv_nlpd': avg_cv_nlpd,
         }
+
+    # ------------------------------------------------------------------
+    # Optimise / refit / predict
+    # ------------------------------------------------------------------
 
     def optimize(self, max_evals=100, tpe_algo=tpe.suggest, early_stop_fn=None, rstate_seed=None):
         self._iteration_count = 0
@@ -313,8 +470,11 @@ class GPCrossValidatedOptimizer:
         if self.trials.best_trial and 'result' in self.trials.best_trial and self.trials.best_trial['result']['status'] == STATUS_OK:
             self.best_params = self.trials.best_trial['result']['params']
             logger.info(f"Best full params from trials: {self.best_params}")
-            logger.info(f"Best CV RMSE from trials: {self.trials.best_trial['result']['loss']}")
-            logger.info(f"Best CV Train RMSE from trials: {self.trials.best_trial['result']['train_loss']}")
+            best_result = self.trials.best_trial['result']
+            logger.info(f"Best loss ({self.scoring}): {best_result['loss']:.4f}")
+            logger.info(f"Best CV RMSE: {best_result['cv_rmse']:.4f}")
+            logger.info(f"Best CV NLPD: {best_result['cv_nlpd']:.4f}")
+            logger.info(f"Best Train RMSE: {best_result['train_loss']:.4f}")
             self.refit_best_model()
         else:
             self.best_params = None
