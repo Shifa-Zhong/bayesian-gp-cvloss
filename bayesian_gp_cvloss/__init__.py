@@ -2,5 +2,11 @@
 # It can also be used to expose parts of the package at the top level.
 
 from .optimizer import GPCrossValidatedOptimizer, DEFAULT_KERNELS, VALID_SCORING
+from .calibration import ConformalCalibrator
 
-__all__ = ['GPCrossValidatedOptimizer', 'DEFAULT_KERNELS', 'VALID_SCORING']
+__all__ = [
+    'GPCrossValidatedOptimizer',
+    'DEFAULT_KERNELS',
+    'VALID_SCORING',
+    'ConformalCalibrator',
+]

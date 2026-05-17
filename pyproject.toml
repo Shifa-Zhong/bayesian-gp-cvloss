@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "bayesian-gp-cvloss"
-version = "0.2.0"
+version = "0.3.0"
 description = "A Python package for Gaussian Process Regression with hyperparameter optimization using Hyperopt and cross-validation, focusing on optimizing cross-validated loss."
 readme = "README.md"
 license = "MIT"
