@@ -27,6 +27,7 @@ This library implements an alternative strategy:
     - `"cv_rmse"` — Minimise cross-validated RMSE (prediction accuracy).
     - `"nlpd"` — Minimise Negative Log Predictive Density (prediction accuracy + uncertainty calibration).
     - `"combined"` — Weighted combination of both, balancing accuracy and calibration.
+*   **Post-hoc variance calibration** (`ConformalCalibrator`, v0.3.0+): pair with `scoring="cv_rmse"` to get RMSE-optimal point predictions plus prediction intervals with a finite-sample marginal coverage guarantee, via locally adaptive split conformal prediction.
 *   **Automatic Leave-One-Out (LOO)**: when the dataset is smaller than `n_splits`, the splitter falls back to LOO automatically.
 *   Supports various GPflow kernels (RBF, Matern32, Matern52, RationalQuadratic by default).
 *   **Smart data-dependent defaults**: search ranges are automatically computed from the training data.
@@ -132,6 +133,50 @@ loss = (1 - nlpd_weight) * norm_RMSE + nlpd_weight * norm_NLPD
 ```
 
 Both metrics are min-max normalised using the optimisation history so that the weight is meaningful regardless of scale. The default `nlpd_weight=0.5` gives equal importance to accuracy and calibration.
+
+## Post-hoc Variance Calibration with `ConformalCalibrator`
+
+NLPD-style joint optimisation pushes the GP toward calibrated variance at the cost of some mean accuracy. If you would rather **keep the RMSE-optimal mean** and fix the variance separately, use `ConformalCalibrator` on top of a `scoring="cv_rmse"` model.
+
+It implements **locally adaptive split conformal prediction**: it does not retrain the GP and makes no Gaussian assumption — it learns a single multiplier `q` from a held-out calibration set so that the intervals `[mu - q*sigma, mu + q*sigma]` have marginal coverage `>= 1 - alpha`.
+
+```python
+from bayesian_gp_cvloss import GPCrossValidatedOptimizer, ConformalCalibrator
+
+# 1. Train the GP with the default cv_rmse objective for best point predictions
+optimizer = GPCrossValidatedOptimizer(X_train, y_train, scoring="cv_rmse")
+optimizer.optimize(max_evals=50)
+
+# 2. Calibrate on a HELD-OUT set (must be disjoint from training data)
+calibrator = ConformalCalibrator(alpha=0.1).fit(optimizer, X_cal, y_cal)
+
+# 3. Get prediction intervals with >= 90% marginal coverage
+mean, lower, upper = calibrator.predict_interval(X_new)
+
+# Or get the calibrated half-width q*sigma directly
+half_width = calibrator.calibrated_half_width(X_new)
+```
+
+### How it works
+
+For each calibration point, compute the normalised residual `s_i = |y_i - mu_i| / sigma_i`. The conformal quantile is the `ceil((n+1)*(1-alpha))`-th smallest score, where the `(n+1)` term is the finite-sample correction that makes the coverage guarantee exact (not just asymptotic).
+
+Because the score divides by `sigma_i`, the GP's per-point uncertainty *ordering* is preserved — points where the GP says it is uncertain still get wider intervals. The calibrator only fixes the overall scale.
+
+### When to use which
+
+| Goal | Recommended approach |
+| --- | --- |
+| Most accurate point predictions + valid prediction intervals | `scoring="cv_rmse"` + `ConformalCalibrator` |
+| Single-pass training, no held-out data to spare | `scoring="nlpd"` or `"combined"` |
+| Bayesian optimisation (acquisition needs proper posterior) | `scoring="nlpd"` or `"combined"` |
+
+### Caveats
+
+*   `X_cal` / `y_cal` **must be disjoint** from the training set, otherwise exchangeability breaks and intervals become over-optimistic.
+*   The guarantee is **marginal**, not conditional: averaged over inputs, coverage is `>= 1 - alpha`, but it may be loose in easy regions and tight in hard ones.
+*   The calibration set must be large enough for the `(n+1)` quantile to exist, i.e. `n >= ceil(1/alpha)`. For `alpha=0.1` that means `n >= 10`.
+*   In active learning / BO loops, newly selected points are not exchangeable with the calibration set, so re-calibrate periodically rather than relying on a one-shot fit.
 
 ## Automatic Leave-One-Out (LOO)
 
