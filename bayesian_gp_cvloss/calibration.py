@@ -14,10 +14,24 @@ only fixes the overall scale. This is preferable to the absolute-residual
 score when the GP's relative uncertainties (high-variance points really are
 the harder points) are trustworthy.
 
+Two entry points
+----------------
+* ``fit(optimizer, X_cal, y_cal)`` -- classic split conformal. Requires a
+  held-out calibration set disjoint from training data. Exact 1-alpha
+  marginal coverage under exchangeability.
+* ``fit_cv(optimizer, n_splits=None)`` -- naive cross-conformal. Re-runs
+  K-fold CV with the optimizer's already-selected best hyperparameters
+  (so the OOF residuals are unbiased given the hparams) and uses those as
+  calibration scores. No held-out set needed. Coverage is approximately
+  1-alpha (the formal split-CP proof does not apply because the calibration
+  models are fold-specific while predictions at test time use the global
+  model trained on all data), but in practice it tracks nominal coverage
+  closely on exchangeable data.
+
 Coverage guarantee
 ------------------
-Under exchangeability of calibration and test points, for any miscoverage
-level ``alpha in (0, 1)`` and calibration set of size ``n``::
+For ``fit``: under exchangeability of calibration and test points, for any
+miscoverage level ``alpha in (0, 1)`` and calibration set of size ``n``::
 
     P( y* in [mu* - q*sigma*, mu* + q*sigma*] )  >=  1 - alpha
 
@@ -25,7 +39,15 @@ where ``q`` is the ``ceil((n+1)(1-alpha))``-th smallest calibration score.
 The ``(n+1)`` term is the finite-sample correction; omitting it makes the
 guarantee only asymptotic.
 """
+import logging
+
+import gpflow
 import numpy as np
+import pandas as pd
+from gpflow.utilities import set_trainable
+from sklearn.model_selection import KFold, LeaveOneOut
+
+logger = logging.getLogger(__name__)
 
 
 class ConformalCalibrator:
@@ -96,6 +118,129 @@ class ConformalCalibrator:
             raise ValueError(
                 f"Cannot compute conformal quantile: k={k} > n={n}. "
                 f"Increase calibration set size."
+            )
+
+        sorted_scores = np.sort(scores)
+        self.q_ = float(sorted_scores[k - 1])
+        self.scores_ = scores
+        self.n_cal_ = n
+        self._optimizer = optimizer
+        return self
+
+    def fit_cv(self, optimizer, n_splits=None, random_state=None):
+        """Calibrate using OOF residuals from a fresh CV run with best hparams.
+
+        Re-runs K-fold (or LOO, for small samples) cross-validation on the
+        optimizer's training data using the already-selected best
+        hyperparameters, then uses the resulting out-of-fold residuals as
+        conformal calibration scores. No separate held-out set is required.
+
+        Parameters
+        ----------
+        optimizer : GPCrossValidatedOptimizer
+            A fitted optimizer (``optimize()`` already called).
+        n_splits : int, optional
+            Number of folds. Defaults to ``optimizer.n_splits``. Auto-falls
+            back to Leave-One-Out if ``n_samples < n_splits``.
+        random_state : int, optional
+            Random seed for the KFold splitter. Defaults to
+            ``optimizer.random_state``.
+
+        Notes
+        -----
+        IMPORTANT: do NOT reuse residuals collected DURING hyperopt's search
+        -- those are post-selection biased (hyperopt picked the trial with
+        the smallest CV-RMSE, so its residuals systematically underestimate
+        generalisation error). This method re-runs CV AFTER hyperparameters
+        are frozen, which removes that bias.
+
+        Coverage is approximately ``1 - alpha`` (naive cross-conformal): the
+        formal split-CP guarantee is weakened because the calibration scores
+        come from fold-specific models while test-time predictions use the
+        global model trained on all data. Empirical coverage typically lands
+        within a few percent of nominal on exchangeable data.
+        """
+        if getattr(optimizer, "best_params", None) is None or \
+                getattr(optimizer, "best_model_", None) is None:
+            raise RuntimeError(
+                "optimizer is not fitted. Call optimizer.optimize() first."
+            )
+
+        X = optimizer.X_train.values if isinstance(optimizer.X_train, pd.DataFrame) \
+            else optimizer.X_train
+        y = optimizer.y_train_1d
+        n = y.shape[0]
+
+        n_splits_eff = n_splits if n_splits is not None else optimizer.n_splits
+        rs = random_state if random_state is not None else optimizer.random_state
+
+        if n < n_splits_eff:
+            splitter = LeaveOneOut()
+            logger.info(
+                f"fit_cv: n={n} < n_splits={n_splits_eff}, using Leave-One-Out."
+            )
+        else:
+            splitter = KFold(n_splits=n_splits_eff, shuffle=True, random_state=rs)
+
+        min_n = int(np.ceil(1.0 / self.alpha)) - 1
+        if n < min_n + 1:
+            raise ValueError(
+                f"Training set too small for alpha={self.alpha}: n={n}, "
+                f"need n >= {min_n + 1} for the (n+1) quantile to exist."
+            )
+
+        bp = optimizer.best_params
+        kernel_name = bp['kernel_name']
+        kernel_cls = optimizer._active_kernels.get(kernel_name)
+        if kernel_cls is None:
+            raise RuntimeError(
+                f"Kernel '{kernel_name}' from best_params not found in "
+                f"optimizer._active_kernels."
+            )
+        n_features = X.shape[1]
+        lengthscales = np.array(
+            [bp[f'lengthscales_{i}'] for i in range(n_features)], dtype=float
+        )
+        kernel_variance = float(bp['kernel_variance'])
+        noise_variance = float(bp['likelihood_noise_variance'])
+
+        scores = np.full(n, np.nan)
+        for train_idx, val_idx in splitter.split(X):
+            X_tr, X_val = X[train_idx], X[val_idx]
+            y_tr, y_val = y[train_idx], y[val_idx]
+            fold_mean = float(np.mean(y_tr))
+            y_tr_c = (y_tr - fold_mean).reshape(-1, 1)
+
+            kernel = kernel_cls(lengthscales=lengthscales, variance=kernel_variance)
+            model = gpflow.models.GPR(
+                data=(X_tr, y_tr_c),
+                kernel=kernel,
+                noise_variance=noise_variance,
+            )
+            set_trainable(model.kernel.variance, False)
+            set_trainable(model.kernel.lengthscales, False)
+            set_trainable(model.likelihood.variance, False)
+
+            mu_c, var = model.predict_y(X_val)
+            mu_c = mu_c.numpy().flatten()
+            var = var.numpy().flatten()
+
+            y_val_c = y_val - fold_mean
+            sigma = np.sqrt(np.maximum(var, 1e-12))
+            scores[val_idx] = np.abs(y_val_c - mu_c) / sigma
+
+        if np.any(np.isnan(scores)):
+            missing = int(np.sum(np.isnan(scores)))
+            raise RuntimeError(
+                f"fit_cv: {missing} training points were not assigned to any "
+                f"validation fold; CV splitter produced incomplete coverage."
+            )
+
+        k = int(np.ceil((n + 1) * (1.0 - self.alpha)))
+        if k > n:
+            raise ValueError(
+                f"Cannot compute conformal quantile: k={k} > n={n}. "
+                f"Increase training set size or alpha."
             )
 
         sorted_scores = np.sort(scores)

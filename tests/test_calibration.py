@@ -195,5 +195,92 @@ class TestEmpiricalCoverage:
         assert covered >= 0.80, f"Empirical coverage {covered:.3f} too low"
 
 
+# ---------------------------------------------------------------------------
+# fit_cv: cross-conformal calibration (no held-out set)
+# ---------------------------------------------------------------------------
+
+class TestFitCV:
+    def test_unfitted_optimizer_rejected(self):
+        rng = np.random.default_rng(11)
+        X = rng.uniform(0, 1, size=(20, 2))
+        y = rng.normal(size=20)
+        opt = GPCrossValidatedOptimizer(X, y, scoring="cv_rmse", random_state=0)
+        cal = ConformalCalibrator(alpha=0.1)
+        with pytest.raises(RuntimeError, match="optimizer is not fitted"):
+            cal.fit_cv(opt)
+
+    def test_basic_fit_cv_sets_attributes(self, fitted_optimizer):
+        opt, X_train, _, _ = fitted_optimizer
+        cal = ConformalCalibrator(alpha=0.1).fit_cv(opt)
+        assert cal.q_ > 0
+        assert cal.n_cal_ == X_train.shape[0]
+        assert cal.scores_.shape == (X_train.shape[0],)
+        assert np.all(cal.scores_ >= 0)
+        assert not np.any(np.isnan(cal.scores_))
+
+    def test_quantile_index_matches_formula(self, fitted_optimizer):
+        opt, X_train, _, _ = fitted_optimizer
+        n = X_train.shape[0]
+        cal = ConformalCalibrator(alpha=0.1).fit_cv(opt)
+        expected_k = int(np.ceil((n + 1) * 0.9))
+        sorted_scores = np.sort(cal.scores_)
+        if expected_k <= n:
+            assert cal.q_ == pytest.approx(sorted_scores[expected_k - 1])
+
+    def test_predict_interval_works_after_fit_cv(self, fitted_optimizer):
+        opt, _, _, rng = fitted_optimizer
+        cal = ConformalCalibrator(alpha=0.1).fit_cv(opt)
+        X_new = rng.uniform(0, 1, size=(8, 2))
+        mean, lo, hi = cal.predict_interval(X_new)
+        assert mean.shape == (8,)
+        assert np.all(lo <= mean)
+        assert np.all(mean <= hi)
+
+    def test_loo_used_for_small_samples(self):
+        """When n < n_splits, the splitter should fall back to LOO."""
+        rng = np.random.default_rng(33)
+        n, d = 12, 2
+        X = rng.uniform(0, 1, size=(n, d))
+        y = np.sin(2 * np.pi * X[:, 0]) + rng.normal(0, 0.1, size=n)
+        opt = GPCrossValidatedOptimizer(
+            X, y, scoring="cv_rmse", n_splits=20, random_state=0
+        )
+        opt.optimize(max_evals=3)
+        cal = ConformalCalibrator(alpha=0.2).fit_cv(opt, n_splits=20)
+        # With n=12 < n_splits=20, LOO kicks in -> every point gets a score
+        assert cal.n_cal_ == n
+        assert not np.any(np.isnan(cal.scores_))
+
+    def test_n_splits_override_respected(self, fitted_optimizer):
+        opt, X_train, _, _ = fitted_optimizer
+        cal3 = ConformalCalibrator(alpha=0.1).fit_cv(opt, n_splits=3, random_state=0)
+        cal5 = ConformalCalibrator(alpha=0.1).fit_cv(opt, n_splits=5, random_state=0)
+        # Different splitters generally yield different score sets
+        assert not np.allclose(np.sort(cal3.scores_), np.sort(cal5.scores_))
+
+    def test_empirical_coverage(self):
+        """OOF-calibrated intervals should approximately cover at the target rate."""
+        rng = np.random.default_rng(2024)
+        n_train, n_test = 80, 200
+        d = 2
+
+        def f(X):
+            return np.sin(2 * np.pi * X[:, 0]) + 0.5 * X[:, 1]
+
+        X_train = rng.uniform(0, 1, size=(n_train, d))
+        y_train = f(X_train) + rng.normal(0, 0.15, size=n_train)
+        opt = GPCrossValidatedOptimizer(
+            X_train, y_train, scoring="cv_rmse", n_splits=5, random_state=0
+        )
+        opt.optimize(max_evals=10)
+        cal = ConformalCalibrator(alpha=0.1).fit_cv(opt)
+
+        X_test = rng.uniform(0, 1, size=(n_test, d))
+        y_test = f(X_test) + rng.normal(0, 0.15, size=n_test)
+        _, lo, hi = cal.predict_interval(X_test)
+        covered = ((y_test >= lo) & (y_test <= hi)).mean()
+        assert covered >= 0.80, f"Empirical coverage {covered:.3f} too low"
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])

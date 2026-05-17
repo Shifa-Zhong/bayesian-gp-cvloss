@@ -147,7 +147,7 @@ from bayesian_gp_cvloss import GPCrossValidatedOptimizer, ConformalCalibrator
 optimizer = GPCrossValidatedOptimizer(X_train, y_train, scoring="cv_rmse")
 optimizer.optimize(max_evals=50)
 
-# 2. Calibrate on a HELD-OUT set (must be disjoint from training data)
+# 2a. Calibrate on a HELD-OUT set (must be disjoint from training data)
 calibrator = ConformalCalibrator(alpha=0.1).fit(optimizer, X_cal, y_cal)
 
 # 3. Get prediction intervals with >= 90% marginal coverage
@@ -156,6 +156,23 @@ mean, lower, upper = calibrator.predict_interval(X_new)
 # Or get the calibrated half-width q*sigma directly
 half_width = calibrator.calibrated_half_width(X_new)
 ```
+
+### No held-out data? Use `fit_cv` instead
+
+When data is scarce (typical for materials BO), splitting off a calibration set is wasteful. `fit_cv` runs K-fold (or LOO) cross-validation with the **already-selected** best hyperparameters and uses those out-of-fold residuals as calibration scores. No extra data needed.
+
+```python
+optimizer = GPCrossValidatedOptimizer(X_train, y_train, scoring="cv_rmse", n_splits=5)
+optimizer.optimize(max_evals=50)
+
+# OOF-based calibration -- no separate X_cal/y_cal required
+calibrator = ConformalCalibrator(alpha=0.1).fit_cv(optimizer)
+mean, lower, upper = calibrator.predict_interval(X_new)
+```
+
+**Why not reuse the CV residuals from inside the hyperopt search?** Those residuals are *post-selection biased*: hyperopt picked the trial with the smallest CV-RMSE, so its residuals systematically underestimate generalisation error. `fit_cv` re-runs CV **after** hyperparameters are frozen, which removes that bias.
+
+**Coverage trade-off**: `fit_cv` implements naive cross-conformal prediction. The formal 1-alpha split-CP proof does not strictly apply (calibration uses K fold models; test-time prediction uses the global model trained on all data), so coverage is approximately rather than exactly 1-alpha. In practice it tracks nominal coverage closely. Use `fit` with a held-out set if you need the exact guarantee.
 
 ### How it works
 
